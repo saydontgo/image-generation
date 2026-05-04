@@ -1,2 +1,10 @@
+# dirs
 __pycache__/
+.vscode/
 
+# files
+*.log
+*.pyc
+*.pyo
+*.pyd
+.envrc
