@@ -26,7 +26,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu.")
     parser.add_argument("--mixed-precision", action="store_true", help="Enable AMP on CUDA.")
 
-    # Hyperparameter: 256 is the safest starting size for a 16GB GPU.
     # Raise to 286 or 512 only after batch size is stable and training does not OOM.
     parser.add_argument("--image-size", type=int, default=256, help="Training crop size.")
     # Hyperparameter: start with 1 on a 16GB card for CycleGAN. If VRAM remains, try 2 or 4.

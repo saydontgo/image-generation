@@ -1,6 +1,7 @@
 # dirs
 __pycache__/
 .vscode/
+data/
 
 # files
 *.log
