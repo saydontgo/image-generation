@@ -1,0 +1,16 @@
+{
+  "monet_style": {
+    "prompt": "turn this photo into an impressionist Monet painting, soft brush strokes, pastel colors, oil painting texture",
+    "negative_prompt": "low quality, blurry, distorted face, extra fingers, text, watermark",
+    "strength": 0.65,
+    "guidance_scale": 7.5,
+    "num_inference_steps": 30
+  },
+  "vangogh_style": {
+    "prompt": "turn this photo into a Van Gogh painting, expressive brush strokes, swirling texture, vivid colors, post-impressionism",
+    "negative_prompt": "low quality, blurry, deformed, text, watermark",
+    "strength": 0.7,
+    "guidance_scale": 8.0,
+    "num_inference_steps": 35
+  }
+}
