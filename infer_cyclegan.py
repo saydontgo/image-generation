@@ -56,9 +56,9 @@ def load_generator(args: argparse.Namespace, device: torch.device) -> torch.nn.M
     ).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
 
-    # Compatible with two common formats:
-    # 1) our bundled checkpoint containing both generators
-    # 2) official CycleGAN-style single-generator state dict such as latest_net_G_A.pth
+    # 兼容两种常见权重格式：
+    # 1) 当前项目导出的、同时包含两个生成器的打包 checkpoint
+    # 2) 官方 CycleGAN 常见的单生成器 state dict，例如 latest_net_G_A.pth
     if isinstance(checkpoint, dict) and any(key in checkpoint for key in ("netG_A", "G_A", "netG_B", "G_B")):
         model.load_generators_only(checkpoint)
         generator = model.netG_A if args.direction == "A2B" else model.netG_B

@@ -26,27 +26,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu.")
     parser.add_argument("--mixed-precision", action="store_true", help="Enable AMP on CUDA.")
 
-    # Raise to 286 or 512 only after batch size is stable and training does not OOM.
+    # 超参数：先从 256 开始。只有在 batch size 已稳定且训练不会爆显存时，再尝试升到 286 或 512。
     parser.add_argument("--image-size", type=int, default=256, help="Training crop size.")
-    # Hyperparameter: start with 1 on a 16GB card for CycleGAN. If VRAM remains, try 2 or 4.
+    # 超参数：16GB 显存训练 CycleGAN 建议先从 1 开始；如果显存还有余量，再尝试 2 或 4。
     parser.add_argument("--batch-size", type=int, default=1, help="Mini-batch size.")
-    # Hyperparameter: 100 is the classic CycleGAN setting. For coursework, 40-80 often already gives usable results.
+    # 超参数：100 是经典 CycleGAN 设置；课程作业通常跑 40 到 80 个 epoch 就能得到可用结果。
     parser.add_argument("--epochs", type=int, default=60, help="Total training epochs.")
-    # Hyperparameter: 2e-4 is the standard value. Lower to 1e-4 if GAN training becomes unstable.
+    # 超参数：2e-4 是标准起点；如果 GAN 训练不稳定，可以降到 1e-4。
     parser.add_argument("--learning-rate", type=float, default=2e-4, help="Initial Adam learning rate.")
-    # Hyperparameter: 0.5 is the classic GAN beta1. Increase cautiously only if loss is too noisy.
+    # 超参数：0.5 是经典 GAN 的 beta1；只有在损失抖动明显时才谨慎调整。
     parser.add_argument("--beta1", type=float, default=0.5, help="Adam beta1.")
     parser.add_argument("--beta2", type=float, default=0.999, help="Adam beta2.")
-    # Hyperparameter: 10 is the standard cycle consistency weight. Raise it to preserve content more strongly.
+    # 超参数：10 是标准的循环一致性权重；想更强地保留原图内容时可以适当调大。
     parser.add_argument("--lambda-cycle", type=float, default=10.0, help="Cycle consistency weight.")
-    # Hyperparameter: 0.5 means identity loss uses 0.5 * lambda_cycle. Raise it if colors drift too much.
+    # 超参数：0.5 表示 identity loss 使用 0.5 * lambda_cycle；如果颜色漂移过大可以适当调高。
     parser.add_argument("--lambda-identity", type=float, default=0.5, help="Identity mapping weight factor.")
-    # Hyperparameter: 64 is the standard channel width. Reduce to 32 if memory is tight; raise only with care.
+    # 超参数：64 是标准通道数；显存紧张可降到 32，如需调高要谨慎，因为显存开销会明显增加。
     parser.add_argument("--generator-channels", type=int, default=64, help="Base generator channels.")
     parser.add_argument("--discriminator-channels", type=int, default=64, help="Base discriminator channels.")
-    # Hyperparameter: 9 blocks are common for 256x256 training. Use 6 blocks if you need a lighter model.
+    # 超参数：256x256 训练常用 9 个残差块；如果想让模型更轻量，可以改成 6。
     parser.add_argument("--res-blocks", type=int, default=9, help="Generator residual blocks.")
-    # Hyperparameter: 50 is the canonical fake-image buffer size. Set to 0 to disable the image pool.
+    # 超参数：50 是经典的伪样本缓存池大小；如果设为 0，则关闭 image pool。
     parser.add_argument("--pool-size", type=int, default=50, help="Historical fake-image pool size.")
     return parser.parse_args()
 
