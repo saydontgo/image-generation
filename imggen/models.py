@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from typing import Callable
 
 import torch
 from torch import nn
@@ -82,16 +83,16 @@ class ResnetGenerator(nn.Module):
 
 
 class OfficialResnetBlock(nn.Module):
-    def __init__(self, dim: int, norm_layer: type[nn.Module], use_bias: bool) -> None:
+    def __init__(self, dim: int, norm_factory: Callable[[int], nn.Module], use_bias: bool) -> None:
         super().__init__()
         self.conv_block = nn.Sequential(
             nn.ReflectionPad2d(1),
             nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
-            norm_layer(dim),
+            norm_factory(dim),
             nn.ReLU(inplace=True),
             nn.ReflectionPad2d(1),
             nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
-            norm_layer(dim),
+            norm_factory(dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,14 +106,16 @@ class OfficialResnetGenerator(nn.Module):
         output_nc: int = 3,
         ngf: int = 64,
         n_blocks: int = 9,
-        norm_layer: type[nn.Module] = nn.InstanceNorm2d,
+        norm_factory: Callable[[int], nn.Module] | None = None,
+        use_bias: bool = True,
     ) -> None:
         super().__init__()
-        use_bias = norm_layer is nn.InstanceNorm2d
+        if norm_factory is None:
+            norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=False)
         layers: list[nn.Module] = [
             nn.ReflectionPad2d(3),
             nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-            norm_layer(ngf),
+            norm_factory(ngf),
             nn.ReLU(inplace=True),
         ]
 
@@ -122,14 +125,14 @@ class OfficialResnetGenerator(nn.Module):
             layers.extend(
                 [
                     nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                    norm_layer(ngf * mult * 2),
+                    norm_factory(ngf * mult * 2),
                     nn.ReLU(inplace=True),
                 ]
             )
 
         mult = 2**n_downsampling
         for _ in range(n_blocks):
-            layers.append(OfficialResnetBlock(ngf * mult, norm_layer=norm_layer, use_bias=use_bias))
+            layers.append(OfficialResnetBlock(ngf * mult, norm_factory=norm_factory, use_bias=use_bias))
 
         for i in range(n_downsampling):
             mult = 2 ** (n_downsampling - i)
@@ -144,7 +147,7 @@ class OfficialResnetGenerator(nn.Module):
                         output_padding=1,
                         bias=use_bias,
                     ),
-                    norm_layer((ngf * mult) // 2),
+                    norm_factory((ngf * mult) // 2),
                     nn.ReLU(inplace=True),
                 ]
             )
@@ -176,8 +179,23 @@ def build_official_generator_from_state_dict(state_dict: dict[str, torch.Tensor]
     if not block_indices:
         raise KeyError("Unsupported official CycleGAN checkpoint: no conv_block weights found")
 
-    norm_layer = nn.BatchNorm2d if any(key.endswith("running_mean") for key in state_dict) else nn.InstanceNorm2d
-    generator = OfficialResnetGenerator(ngf=ngf, n_blocks=len(block_indices), norm_layer=norm_layer)
+    conv_has_bias = "model.1.bias" in state_dict
+    has_running_stats = any(key.endswith("running_mean") for key in state_dict)
+    has_affine = any(re.match(r"model\.(2|5|8)\.weight$", key) for key in state_dict)
+
+    if has_running_stats and has_affine:
+        norm_factory = lambda channels: nn.BatchNorm2d(channels)
+    elif has_running_stats and not has_affine:
+        norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=True)
+    else:
+        norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=False)
+
+    generator = OfficialResnetGenerator(
+        ngf=ngf,
+        n_blocks=len(block_indices),
+        norm_factory=norm_factory,
+        use_bias=conv_has_bias,
+    )
     generator.load_state_dict(state_dict)
     return generator
 
