@@ -4,12 +4,11 @@ import argparse
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torchvision import transforms
 from tqdm import tqdm
 
-from imggen import CycleGANModel, build_official_generator_from_state_dict, collect_image_paths
+from imggen import build_official_generator_from_state_dict, collect_image_paths
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,33 +91,6 @@ def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(array)
 
 
-def preprocess_image(image: Image.Image, image_size: int) -> tuple[torch.Tensor, dict[str, int]]:
-    width, height = image.size
-    scale = image_size / max(width, height)
-    resized_width = max(1, round(width * scale))
-    resized_height = max(1, round(height * scale))
-    resized = image.resize((resized_width, resized_height), Image.Resampling.BICUBIC)
-
-    tensor = transforms.ToTensor()(resized)
-    pad_left = (image_size - resized_width) // 2
-    pad_right = image_size - resized_width - pad_left
-    pad_top = (image_size - resized_height) // 2
-    pad_bottom = image_size - resized_height - pad_top
-    tensor = F.pad(tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
-    tensor = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))(tensor)
-    meta = {
-        "orig_width": width,
-        "orig_height": height,
-        "resized_width": resized_width,
-        "resized_height": resized_height,
-        "pad_left": pad_left,
-        "pad_right": pad_right,
-        "pad_top": pad_top,
-        "pad_bottom": pad_bottom,
-    }
-    return tensor.unsqueeze(0), meta
-
-
 def preprocess_image_official(image: Image.Image, image_size: int) -> tuple[torch.Tensor, dict[str, int]]:
     width, height = image.size
     resized = image.resize((image_size, image_size), Image.Resampling.BICUBIC)
@@ -131,74 +103,47 @@ def preprocess_image_official(image: Image.Image, image_size: int) -> tuple[torc
     return tensor.unsqueeze(0), meta
 
 
-def postprocess_image(image_tensor: torch.Tensor, meta: dict[str, int]) -> Image.Image:
-    image = tensor_to_pil(image_tensor)
-    left = meta["pad_left"]
-    top = meta["pad_top"]
-    right = left + meta["resized_width"]
-    bottom = top + meta["resized_height"]
-    image = image.crop((left, top, right, bottom))
-    return image.resize((meta["orig_width"], meta["orig_height"]), Image.Resampling.LANCZOS)
-
-
 def postprocess_image_official(image_tensor: torch.Tensor, meta: dict[str, int]) -> Image.Image:
     image = tensor_to_pil(image_tensor)
     return image.resize((meta["orig_width"], meta["orig_height"]), Image.Resampling.LANCZOS)
 
 
+def extract_generator_state_dict(checkpoint: dict[str, object], direction: str) -> dict[str, torch.Tensor]:
+    if "netG_A" in checkpoint and "netG_B" in checkpoint:
+        selected = checkpoint["netG_A"] if direction == "A2B" else checkpoint["netG_B"]
+        return selected  # type: ignore[return-value]
+    if "G_A" in checkpoint and "G_B" in checkpoint:
+        selected = checkpoint["G_A"] if direction == "A2B" else checkpoint["G_B"]
+        return selected  # type: ignore[return-value]
+    return checkpoint  # type: ignore[return-value]
+
+
 def load_generator_from_checkpoint(
     checkpoint_path: str,
     direction: str,
-    generator_channels: int,
-    discriminator_channels: int,
-    res_blocks: int,
     official_norm: str,
     official_use_dropout: bool,
     device: torch.device,
-) -> tuple[torch.nn.Module, str]:
-    model = CycleGANModel(
-        generator_channels=generator_channels,
-        discriminator_channels=discriminator_channels,
-        res_blocks=res_blocks,
+) -> torch.nn.Module:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Unsupported checkpoint format.")
+    state_dict = extract_generator_state_dict(checkpoint, direction)
+    if not isinstance(state_dict, dict):
+        raise TypeError("Unsupported generator state_dict format.")
+    generator = build_official_generator_from_state_dict(
+        state_dict,
         norm_type=official_norm,
         use_dropout=official_use_dropout,
     ).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    # 兼容两种常见权重格式：
-    # 1) 当前项目导出的、同时包含两个生成器的打包 checkpoint
-    # 2) 官方 CycleGAN 常见的单生成器 state dict，例如 latest_net_G_A.pth
-    if isinstance(checkpoint, dict) and any(key in checkpoint for key in ("netG_A", "G_A", "netG_B", "G_B")):
-        model.load_generators_only(checkpoint)
-        generator = model.netG_A if direction == "A2B" else model.netG_B
-        preprocess_mode = "custom"
-    elif isinstance(checkpoint, dict):
-        generator = model.netG_A if direction == "A2B" else model.netG_B
-        try:
-            generator.load_state_dict(checkpoint)
-            preprocess_mode = "custom"
-        except RuntimeError as error:
-            if not any("conv_block" in key for key in checkpoint):
-                raise error
-            generator = build_official_generator_from_state_dict(
-                checkpoint,
-                norm_type=official_norm,
-                use_dropout=official_use_dropout,
-            ).to(device)
-            preprocess_mode = "official_test"
-    else:
-        raise TypeError("Unsupported checkpoint format.")
     generator.eval()
-    return generator, preprocess_mode
+    return generator
 
 
-def load_generator(args: argparse.Namespace, device: torch.device) -> tuple[torch.nn.Module, str]:
+def load_generator(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
     return load_generator_from_checkpoint(
         checkpoint_path=args.checkpoint,
         direction=args.direction,
-        generator_channels=args.generator_channels,
-        discriminator_channels=args.discriminator_channels,
-        res_blocks=args.res_blocks,
         official_norm=args.official_norm,
         official_use_dropout=args.official_use_dropout,
         device=device,
@@ -208,22 +153,14 @@ def load_generator(args: argparse.Namespace, device: torch.device) -> tuple[torc
 def run_generator(
     image: Image.Image,
     generator: torch.nn.Module,
-    preprocess_mode: str,
     image_size: int,
     device: torch.device,
 ) -> Image.Image:
-    if preprocess_mode == "official_test":
-        tensor, meta = preprocess_image_official(image, image_size)
-        tensor = tensor.to(device)
-        with torch.no_grad():
-            generated = generator(tensor)
-        return postprocess_image_official(generated, meta)
-
-    tensor, meta = preprocess_image(image, image_size)
+    tensor, meta = preprocess_image_official(image, image_size)
     tensor = tensor.to(device)
     with torch.no_grad():
         generated = generator(tensor)
-    return postprocess_image(generated, meta)
+    return postprocess_image_official(generated, meta)
 
 
 def main() -> None:
@@ -241,16 +178,12 @@ def main() -> None:
     comparison_dir = Path(args.comparison_dir) if args.comparison_dir else None
     if comparison_dir is not None:
         comparison_dir.mkdir(parents=True, exist_ok=True)
-    generator, generator_preprocess_mode = load_generator(args, device)
+    generator = load_generator(args, device)
     baseline_generator = None
-    baseline_preprocess_mode = "custom"
     if args.baseline_checkpoint:
-        baseline_generator, baseline_preprocess_mode = load_generator_from_checkpoint(
+        baseline_generator = load_generator_from_checkpoint(
             checkpoint_path=args.baseline_checkpoint,
             direction=args.direction,
-            generator_channels=args.generator_channels,
-            discriminator_channels=args.discriminator_channels,
-            res_blocks=args.res_blocks,
             official_norm=args.official_norm,
             official_use_dropout=args.official_use_dropout,
             device=device,
@@ -263,7 +196,6 @@ def main() -> None:
             baseline_restored = run_generator(
                 image=image,
                 generator=baseline_generator,
-                preprocess_mode=baseline_preprocess_mode,
                 image_size=args.image_size,
                 device=device,
             )
@@ -272,7 +204,6 @@ def main() -> None:
         restored = run_generator(
             image=image,
             generator=generator,
-            preprocess_mode=generator_preprocess_mode,
             image_size=args.image_size,
             device=device,
         )
