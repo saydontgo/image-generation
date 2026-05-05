@@ -160,6 +160,8 @@ def load_generator_from_checkpoint(
         generator_channels=generator_channels,
         discriminator_channels=discriminator_channels,
         res_blocks=res_blocks,
+        norm_type=official_norm,
+        use_dropout=official_use_dropout,
     ).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
 

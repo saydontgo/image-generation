@@ -225,6 +225,57 @@ class OfficialResnetGenerator(nn.Module):
         return self.model(x)
 
 
+class OfficialNLayerDiscriminator(nn.Module):
+    def __init__(
+        self,
+        input_nc: int,
+        ndf: int = 64,
+        n_layers: int = 3,
+        norm_layer: Callable[[int], nn.Module] | None = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = get_official_norm_layer("instance")
+        if isinstance(norm_layer, functools.partial):
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        kw = 4
+        padw = 1
+        sequence: list[nn.Module] = [
+            nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
+            nn.LeakyReLU(0.2, True),
+        ]
+        nf_mult = 1
+        nf_mult_prev = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**n, 8)
+            sequence.extend(
+                [
+                    nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
+                    norm_layer(ndf * nf_mult),
+                    nn.LeakyReLU(0.2, True),
+                ]
+            )
+
+        nf_mult_prev = nf_mult
+        nf_mult = min(2**n_layers, 8)
+        sequence.extend(
+            [
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
+                norm_layer(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True),
+            ]
+        )
+        sequence.append(nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw))
+        self.model = nn.Sequential(*sequence)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
 def patch_official_instance_norm_state_dict(state_dict: dict[str, torch.Tensor], module: nn.Module, keys: list[str], i: int = 0) -> None:
     key = keys[i]
     if i + 1 == len(keys):
@@ -312,6 +363,29 @@ def init_weights(module: nn.Module) -> None:
         nn.init.constant_(module.bias.data, 0.0)
 
 
+def init_official_weights(net: nn.Module, init_type: str = "normal", init_gain: float = 0.02) -> None:
+    def init_func(module: nn.Module) -> None:
+        classname = module.__class__.__name__
+        if hasattr(module, "weight") and ("Conv" in classname or "Linear" in classname):
+            if init_type == "normal":
+                nn.init.normal_(module.weight.data, 0.0, init_gain)
+            elif init_type == "xavier":
+                nn.init.xavier_normal_(module.weight.data, gain=init_gain)
+            elif init_type == "kaiming":
+                nn.init.kaiming_normal_(module.weight.data, a=0, mode="fan_in")
+            elif init_type == "orthogonal":
+                nn.init.orthogonal_(module.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError(f"initialization method [{init_type}] is not implemented")
+            if getattr(module, "bias", None) is not None:
+                nn.init.constant_(module.bias.data, 0.0)
+        elif classname.find("BatchNorm2d") != -1:
+            nn.init.normal_(module.weight.data, 1.0, init_gain)
+            nn.init.constant_(module.bias.data, 0.0)
+
+    net.apply(init_func)
+
+
 @dataclass
 class CycleGANLosses:
     loss_g: torch.Tensor
@@ -331,17 +405,43 @@ class CycleGANModel(nn.Module):
         discriminator_channels: int = 64,
         res_blocks: int = 9,
         pool_size: int = 50,
+        norm_type: str = "instance",
+        use_dropout: bool = False,
+        discriminator_layers: int = 3,
+        init_type: str = "normal",
+        init_gain: float = 0.02,
     ) -> None:
         super().__init__()
-        self.netG_A = ResnetGenerator(ngf=generator_channels, n_blocks=res_blocks)
-        self.netG_B = ResnetGenerator(ngf=generator_channels, n_blocks=res_blocks)
-        self.netD_A = NLayerDiscriminator(ndf=discriminator_channels)
-        self.netD_B = NLayerDiscriminator(ndf=discriminator_channels)
+        norm_layer = get_official_norm_layer(norm_type)
+        self.netG_A = OfficialResnetGenerator(
+            ngf=generator_channels,
+            n_blocks=res_blocks,
+            norm_layer=norm_layer,
+            use_dropout=use_dropout,
+        )
+        self.netG_B = OfficialResnetGenerator(
+            ngf=generator_channels,
+            n_blocks=res_blocks,
+            norm_layer=norm_layer,
+            use_dropout=use_dropout,
+        )
+        self.netD_A = OfficialNLayerDiscriminator(
+            input_nc=3,
+            ndf=discriminator_channels,
+            n_layers=discriminator_layers,
+            norm_layer=norm_layer,
+        )
+        self.netD_B = OfficialNLayerDiscriminator(
+            input_nc=3,
+            ndf=discriminator_channels,
+            n_layers=discriminator_layers,
+            norm_layer=norm_layer,
+        )
 
-        self.netG_A.apply(init_weights)
-        self.netG_B.apply(init_weights)
-        self.netD_A.apply(init_weights)
-        self.netD_B.apply(init_weights)
+        init_official_weights(self.netG_A, init_type=init_type, init_gain=init_gain)
+        init_official_weights(self.netG_B, init_type=init_type, init_gain=init_gain)
+        init_official_weights(self.netD_A, init_type=init_type, init_gain=init_gain)
+        init_official_weights(self.netD_B, init_type=init_type, init_gain=init_gain)
 
         self.lambda_cycle = lambda_cycle
         self.lambda_identity = lambda_identity

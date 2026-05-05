@@ -46,6 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discriminator-channels", type=int, default=64, help="Base discriminator channels.")
     # 超参数：256x256 训练一般 9 个残差块
     parser.add_argument("--res-blocks", type=int, default=9, help="Generator residual blocks.")
+    # 超参数：官方 CycleGAN 默认使用 instance norm，建议先不要改。
+    parser.add_argument("--norm-type", type=str, default="instance", choices=["instance", "batch", "none"], help="Normalization used by official-style generators/discriminators.")
+    # 超参数：官方 CycleGAN 默认 no_dropout=True。风格变化不明显时先不要盲目打开 dropout。
+    parser.add_argument("--use-dropout", action="store_true", help="Enable dropout in the official-style generator.")
+    # 超参数：PatchGAN 判别器层数，官方 basic 判别器等价于 3 层。
+    parser.add_argument("--discriminator-layers", type=int, default=3, help="Number of PatchGAN layers.")
+    # 超参数：官方仓库默认 normal 初始化。
+    parser.add_argument("--init-type", type=str, default="normal", choices=["normal", "xavier", "kaiming", "orthogonal"], help="Weight initialization method.")
+    parser.add_argument("--init-gain", type=float, default=0.02, help="Initialization scaling gain.")
     # 超参数：伪样本缓存池大小
     parser.add_argument("--pool-size", type=int, default=50, help="Historical fake-image pool size.")
     return parser.parse_args()
@@ -117,6 +126,11 @@ def main() -> None:
         discriminator_channels=args.discriminator_channels,
         res_blocks=args.res_blocks,
         pool_size=args.pool_size,
+        norm_type=args.norm_type,
+        use_dropout=args.use_dropout,
+        discriminator_layers=args.discriminator_layers,
+        init_type=args.init_type,
+        init_gain=args.init_gain,
     ).to(device)
     optimizer_g = torch.optim.Adam(
         list(model.netG_A.parameters()) + list(model.netG_B.parameters()),
