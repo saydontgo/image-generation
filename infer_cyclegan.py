@@ -4,15 +4,16 @@ import argparse
 from pathlib import Path
 
 import torch
-from PIL import Image
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
 from torchvision import transforms
 from tqdm import tqdm
 
-from imggen import CycleGANModel, collect_image_paths, save_image_tensor
+from imggen import CycleGANModel, collect_image_paths
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run CycleGAN generators on a photo folder.")
+    parser = argparse.ArgumentParser(description="Run CycleGAN inference and optionally export side-by-side comparison sheets.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to a generator checkpoint.")
     parser.add_argument("--input", type=str, required=True, help="Input image file or folder.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory for generated outputs.")
@@ -23,11 +24,14 @@ def parse_args() -> argparse.Namespace:
         choices=["A2B", "B2A"],
         help="A2B means photo->art if train-a was photo and train-b was artwork.",
     )
-    parser.add_argument("--image-size", type=int, default=256, help="Resize shorter side before center crop.")
+    parser.add_argument("--image-size", type=int, default=256, help="Generator input size. Inference keeps original output size after restoration.")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu.")
     parser.add_argument("--generator-channels", type=int, default=64, help="Must match training config.")
     parser.add_argument("--discriminator-channels", type=int, default=64, help="Must match training config.")
     parser.add_argument("--res-blocks", type=int, default=9, help="Must match training config.")
+    parser.add_argument("--comparison-dir", type=str, default="", help="Optional directory for side-by-side comparison images.")
+    parser.add_argument("--generated-label", type=str, default="generated", help="Label shown on the generated panel.")
+    parser.add_argument("--label-height", type=int, default=36, help="Label area height for comparison sheets.")
     return parser.parse_args()
 
 
@@ -37,15 +41,67 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def build_transform(image_size: int) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize(image_size, Image.Resampling.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
+def add_label(image: Image.Image, label: str, label_height: int) -> Image.Image:
+    canvas = Image.new("RGB", (image.width, image.height + label_height), color=(255, 255, 255))
+    canvas.paste(image, (0, label_height))
+    ImageDraw.Draw(canvas).text((12, 10), label, fill=(0, 0, 0))
+    return canvas
+
+
+def compose_row(images: list[Image.Image]) -> Image.Image:
+    width = sum(image.width for image in images)
+    height = max(image.height for image in images)
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+    offset = 0
+    for image in images:
+        canvas.paste(image, (offset, 0))
+        offset += image.width
+    return canvas
+
+
+def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
+    tensor = image_tensor.detach().cpu().clamp(-1.0, 1.0)
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    array = ((tensor + 1.0) * 127.5).permute(1, 2, 0).numpy().astype("uint8")
+    return Image.fromarray(array)
+
+
+def preprocess_image(image: Image.Image, image_size: int) -> tuple[torch.Tensor, dict[str, int]]:
+    width, height = image.size
+    scale = image_size / max(width, height)
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    resized = image.resize((resized_width, resized_height), Image.Resampling.BICUBIC)
+
+    tensor = transforms.ToTensor()(resized)
+    pad_left = (image_size - resized_width) // 2
+    pad_right = image_size - resized_width - pad_left
+    pad_top = (image_size - resized_height) // 2
+    pad_bottom = image_size - resized_height - pad_top
+    tensor = F.pad(tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
+    tensor = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))(tensor)
+    meta = {
+        "orig_width": width,
+        "orig_height": height,
+        "resized_width": resized_width,
+        "resized_height": resized_height,
+        "pad_left": pad_left,
+        "pad_right": pad_right,
+        "pad_top": pad_top,
+        "pad_bottom": pad_bottom,
+    }
+    return tensor.unsqueeze(0), meta
+
+
+def postprocess_image(image_tensor: torch.Tensor, meta: dict[str, int]) -> Image.Image:
+    image = tensor_to_pil(image_tensor)
+    left = meta["pad_left"]
+    top = meta["pad_top"]
+    right = left + meta["resized_width"]
+    bottom = top + meta["resized_height"]
+    image = image.crop((left, top, right, bottom))
+    return image.resize((meta["orig_width"], meta["orig_height"]), Image.Resampling.LANCZOS)
 
 
 def load_generator(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
@@ -80,15 +136,26 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    transform = build_transform(args.image_size)
+    comparison_dir = Path(args.comparison_dir) if args.comparison_dir else None
+    if comparison_dir is not None:
+        comparison_dir.mkdir(parents=True, exist_ok=True)
     generator = load_generator(args, device)
 
     for image_path in tqdm(input_paths, desc="infer", ncols=100):
         image = Image.open(image_path).convert("RGB")
-        tensor = transform(image).unsqueeze(0).to(device)
+        tensor, meta = preprocess_image(image, args.image_size)
+        tensor = tensor.to(device)
         with torch.no_grad():
             generated = generator(tensor)
-        save_image_tensor(generated, output_dir / image_path.name)
+        restored = postprocess_image(generated, meta)
+        restored.save(output_dir / image_path.name)
+
+        if comparison_dir is not None:
+            panels = [
+                add_label(image, "input", args.label_height),
+                add_label(restored, args.generated_label, args.label_height),
+            ]
+            compose_row(panels).save(comparison_dir / image_path.name)
 
     print(f"Finished inference for {len(input_paths)} images. Output dir: {output_dir}")
 
