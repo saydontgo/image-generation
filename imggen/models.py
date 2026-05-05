@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import re
 from typing import Callable
 
@@ -82,18 +83,64 @@ class ResnetGenerator(nn.Module):
         return self.model(x)
 
 
+def get_official_norm_layer(norm_type: str = "instance"):
+    if norm_type == "batch":
+        return functools.partial(nn.BatchNorm2d, affine=True, track_running_stats=True)
+    if norm_type == "instance":
+        return functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
+    if norm_type == "none":
+        return lambda _channels: nn.Identity()
+    raise NotImplementedError(f"normalization layer [{norm_type}] is not found")
+
+
 class OfficialResnetBlock(nn.Module):
-    def __init__(self, dim: int, norm_factory: Callable[[int], nn.Module], use_bias: bool) -> None:
+    def __init__(
+        self,
+        dim: int,
+        padding_type: str,
+        norm_layer: Callable[[int], nn.Module],
+        use_dropout: bool,
+        use_bias: bool,
+    ) -> None:
         super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
-            norm_factory(dim),
-            nn.ReLU(inplace=True),
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
-            norm_factory(dim),
+        conv_block: list[nn.Module] = []
+        padding = 0
+        if padding_type == "reflect":
+            conv_block.append(nn.ReflectionPad2d(1))
+        elif padding_type == "replicate":
+            conv_block.append(nn.ReplicationPad2d(1))
+        elif padding_type == "zero":
+            padding = 1
+        else:
+            raise NotImplementedError(f"padding [{padding_type}] is not implemented")
+
+        conv_block.extend(
+            [
+                nn.Conv2d(dim, dim, kernel_size=3, padding=padding, bias=use_bias),
+                norm_layer(dim),
+                nn.ReLU(True),
+            ]
         )
+        if use_dropout:
+            conv_block.append(nn.Dropout(0.5))
+
+        padding = 0
+        if padding_type == "reflect":
+            conv_block.append(nn.ReflectionPad2d(1))
+        elif padding_type == "replicate":
+            conv_block.append(nn.ReplicationPad2d(1))
+        elif padding_type == "zero":
+            padding = 1
+        else:
+            raise NotImplementedError(f"padding [{padding_type}] is not implemented")
+
+        conv_block.extend(
+            [
+                nn.Conv2d(dim, dim, kernel_size=3, padding=padding, bias=use_bias),
+                norm_layer(dim),
+            ]
+        )
+        self.conv_block = nn.Sequential(*conv_block)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.conv_block(x)
@@ -106,17 +153,22 @@ class OfficialResnetGenerator(nn.Module):
         output_nc: int = 3,
         ngf: int = 64,
         n_blocks: int = 9,
-        norm_factory: Callable[[int], nn.Module] | None = None,
-        use_bias: bool = True,
+        norm_layer: Callable[[int], nn.Module] | None = None,
+        use_dropout: bool = False,
+        padding_type: str = "reflect",
     ) -> None:
         super().__init__()
-        if norm_factory is None:
-            norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=False)
+        if norm_layer is None:
+            norm_layer = get_official_norm_layer("instance")
+        if isinstance(norm_layer, functools.partial):
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
         layers: list[nn.Module] = [
             nn.ReflectionPad2d(3),
             nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-            norm_factory(ngf),
-            nn.ReLU(inplace=True),
+            norm_layer(ngf),
+            nn.ReLU(True),
         ]
 
         n_downsampling = 2
@@ -125,14 +177,22 @@ class OfficialResnetGenerator(nn.Module):
             layers.extend(
                 [
                     nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                    norm_factory(ngf * mult * 2),
-                    nn.ReLU(inplace=True),
+                    norm_layer(ngf * mult * 2),
+                    nn.ReLU(True),
                 ]
             )
 
         mult = 2**n_downsampling
         for _ in range(n_blocks):
-            layers.append(OfficialResnetBlock(ngf * mult, norm_factory=norm_factory, use_bias=use_bias))
+            layers.append(
+                OfficialResnetBlock(
+                    ngf * mult,
+                    padding_type=padding_type,
+                    norm_layer=norm_layer,
+                    use_dropout=use_dropout,
+                    use_bias=use_bias,
+                )
+            )
 
         for i in range(n_downsampling):
             mult = 2 ** (n_downsampling - i)
@@ -147,8 +207,8 @@ class OfficialResnetGenerator(nn.Module):
                         output_padding=1,
                         bias=use_bias,
                     ),
-                    norm_factory((ngf * mult) // 2),
-                    nn.ReLU(inplace=True),
+                    norm_layer((ngf * mult) // 2),
+                    nn.ReLU(True),
                 ]
             )
 
@@ -165,7 +225,23 @@ class OfficialResnetGenerator(nn.Module):
         return self.model(x)
 
 
-def build_official_generator_from_state_dict(state_dict: dict[str, torch.Tensor]) -> nn.Module:
+def patch_official_instance_norm_state_dict(state_dict: dict[str, torch.Tensor], module: nn.Module, keys: list[str], i: int = 0) -> None:
+    key = keys[i]
+    if i + 1 == len(keys):
+        if module.__class__.__name__.startswith("InstanceNorm") and (key == "running_mean" or key == "running_var"):
+            if getattr(module, key) is None:
+                state_dict.pop(".".join(keys), None)
+        if module.__class__.__name__.startswith("InstanceNorm") and key == "num_batches_tracked":
+            state_dict.pop(".".join(keys), None)
+    else:
+        patch_official_instance_norm_state_dict(state_dict, getattr(module, key), keys, i + 1)
+
+
+def build_official_generator_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    norm_type: str = "instance",
+    use_dropout: bool = False,
+) -> nn.Module:
     if "model.1.weight" not in state_dict:
         raise KeyError("Unsupported official CycleGAN checkpoint: missing model.1.weight")
 
@@ -179,24 +255,19 @@ def build_official_generator_from_state_dict(state_dict: dict[str, torch.Tensor]
     if not block_indices:
         raise KeyError("Unsupported official CycleGAN checkpoint: no conv_block weights found")
 
-    conv_has_bias = "model.1.bias" in state_dict
-    has_running_stats = any(key.endswith("running_mean") for key in state_dict)
-    has_affine = any(re.match(r"model\.(2|5|8)\.weight$", key) for key in state_dict)
-
-    if has_running_stats and has_affine:
-        norm_factory = lambda channels: nn.BatchNorm2d(channels)
-    elif has_running_stats and not has_affine:
-        norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=True)
-    else:
-        norm_factory = lambda channels: nn.InstanceNorm2d(channels, affine=False, track_running_stats=False)
-
+    norm_layer = get_official_norm_layer(norm_type)
     generator = OfficialResnetGenerator(
         ngf=ngf,
         n_blocks=len(block_indices),
-        norm_factory=norm_factory,
-        use_bias=conv_has_bias,
+        norm_layer=norm_layer,
+        use_dropout=use_dropout,
     )
-    generator.load_state_dict(state_dict)
+    patched_state_dict = dict(state_dict)
+    if hasattr(patched_state_dict, "_metadata"):
+        del patched_state_dict._metadata
+    for key in list(patched_state_dict.keys()):
+        patch_official_instance_norm_state_dict(patched_state_dict, generator, key.split("."))
+    generator.load_state_dict(patched_state_dict)
     return generator
 
 
