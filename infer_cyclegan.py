@@ -18,6 +18,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=str, required=True, help="Input image file or folder.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory for generated outputs.")
     parser.add_argument(
+        "--baseline-checkpoint",
+        type=str,
+        default="",
+        help="Optional public/pretrained generator checkpoint used for side-by-side comparison.",
+    )
+    parser.add_argument(
+        "--baseline-output-dir",
+        type=str,
+        default="",
+        help="Optional directory to save outputs from the public/pretrained model.",
+    )
+    parser.add_argument(
         "--direction",
         type=str,
         default="A2B",
@@ -31,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--res-blocks", type=int, default=9, help="Must match training config.")
     parser.add_argument("--comparison-dir", type=str, default="", help="Optional directory for side-by-side comparison images.")
     parser.add_argument("--generated-label", type=str, default="generated", help="Label shown on the generated panel.")
+    parser.add_argument("--baseline-label", type=str, default="pretrained", help="Label shown on the public/pretrained panel.")
     parser.add_argument("--label-height", type=int, default=36, help="Label area height for comparison sheets.")
     return parser.parse_args()
 
@@ -104,27 +117,45 @@ def postprocess_image(image_tensor: torch.Tensor, meta: dict[str, int]) -> Image
     return image.resize((meta["orig_width"], meta["orig_height"]), Image.Resampling.LANCZOS)
 
 
-def load_generator(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+def load_generator_from_checkpoint(
+    checkpoint_path: str,
+    direction: str,
+    generator_channels: int,
+    discriminator_channels: int,
+    res_blocks: int,
+    device: torch.device,
+) -> torch.nn.Module:
     model = CycleGANModel(
-        generator_channels=args.generator_channels,
-        discriminator_channels=args.discriminator_channels,
-        res_blocks=args.res_blocks,
+        generator_channels=generator_channels,
+        discriminator_channels=discriminator_channels,
+        res_blocks=res_blocks,
     ).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # 兼容两种常见权重格式：
     # 1) 当前项目导出的、同时包含两个生成器的打包 checkpoint
     # 2) 官方 CycleGAN 常见的单生成器 state dict，例如 latest_net_G_A.pth
     if isinstance(checkpoint, dict) and any(key in checkpoint for key in ("netG_A", "G_A", "netG_B", "G_B")):
         model.load_generators_only(checkpoint)
-        generator = model.netG_A if args.direction == "A2B" else model.netG_B
+        generator = model.netG_A if direction == "A2B" else model.netG_B
     elif isinstance(checkpoint, dict):
-        generator = model.netG_A if args.direction == "A2B" else model.netG_B
+        generator = model.netG_A if direction == "A2B" else model.netG_B
         generator.load_state_dict(checkpoint)
     else:
         raise TypeError("Unsupported checkpoint format.")
     generator.eval()
     return generator
+
+
+def load_generator(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    return load_generator_from_checkpoint(
+        checkpoint_path=args.checkpoint,
+        direction=args.direction,
+        generator_channels=args.generator_channels,
+        discriminator_channels=args.discriminator_channels,
+        res_blocks=args.res_blocks,
+        device=device,
+    )
 
 
 def main() -> None:
@@ -136,25 +167,45 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    baseline_output_dir = Path(args.baseline_output_dir) if args.baseline_output_dir else None
+    if baseline_output_dir is not None:
+        baseline_output_dir.mkdir(parents=True, exist_ok=True)
     comparison_dir = Path(args.comparison_dir) if args.comparison_dir else None
     if comparison_dir is not None:
         comparison_dir.mkdir(parents=True, exist_ok=True)
     generator = load_generator(args, device)
+    baseline_generator = None
+    if args.baseline_checkpoint:
+        baseline_generator = load_generator_from_checkpoint(
+            checkpoint_path=args.baseline_checkpoint,
+            direction=args.direction,
+            generator_channels=args.generator_channels,
+            discriminator_channels=args.discriminator_channels,
+            res_blocks=args.res_blocks,
+            device=device,
+        )
 
     for image_path in tqdm(input_paths, desc="infer", ncols=100):
         image = Image.open(image_path).convert("RGB")
         tensor, meta = preprocess_image(image, args.image_size)
         tensor = tensor.to(device)
+        baseline_restored = None
+        if baseline_generator is not None:
+            with torch.no_grad():
+                baseline_generated = baseline_generator(tensor)
+            baseline_restored = postprocess_image(baseline_generated, meta)
+            if baseline_output_dir is not None:
+                baseline_restored.save(baseline_output_dir / image_path.name)
         with torch.no_grad():
             generated = generator(tensor)
         restored = postprocess_image(generated, meta)
         restored.save(output_dir / image_path.name)
 
         if comparison_dir is not None:
-            panels = [
-                add_label(image, "input", args.label_height),
-                add_label(restored, args.generated_label, args.label_height),
-            ]
+            panels = [add_label(image, "input", args.label_height)]
+            if baseline_restored is not None:
+                panels.append(add_label(baseline_restored, args.baseline_label, args.label_height))
+            panels.append(add_label(restored, args.generated_label, args.label_height))
             compose_row(panels).save(comparison_dir / image_path.name)
 
     print(f"Finished inference for {len(input_paths)} images. Output dir: {output_dir}")
