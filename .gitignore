@@ -4,6 +4,8 @@ __pycache__/
 data/
 checkpoints/
 outputs/
+pytorch-CycleGAN-and-pix2pix/
+download/
 
 # files
 *.log
