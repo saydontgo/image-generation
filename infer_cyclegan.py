@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 from torchvision import transforms
 from tqdm import tqdm
 
-from imggen import CycleGANModel, collect_image_paths
+from imggen import CycleGANModel, build_official_generator_from_state_dict, collect_image_paths
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,7 +140,14 @@ def load_generator_from_checkpoint(
         generator = model.netG_A if direction == "A2B" else model.netG_B
     elif isinstance(checkpoint, dict):
         generator = model.netG_A if direction == "A2B" else model.netG_B
-        generator.load_state_dict(checkpoint)
+        try:
+            generator.load_state_dict(checkpoint)
+        except RuntimeError as error:
+            # Public CycleGAN weights often come from the official architecture,
+            # whose block naming and normalization layers differ from our training code.
+            if not any("conv_block" in key for key in checkpoint):
+                raise error
+            generator = build_official_generator_from_state_dict(checkpoint).to(device)
     else:
         raise TypeError("Unsupported checkpoint format.")
     generator.eval()

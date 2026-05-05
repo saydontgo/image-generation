@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import torch
 from torch import nn
@@ -78,6 +79,107 @@ class ResnetGenerator(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
+
+
+class OfficialResnetBlock(nn.Module):
+    def __init__(self, dim: int, norm_layer: type[nn.Module], use_bias: bool) -> None:
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
+            norm_layer(dim),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, bias=use_bias),
+            norm_layer(dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.conv_block(x)
+
+
+class OfficialResnetGenerator(nn.Module):
+    def __init__(
+        self,
+        input_nc: int = 3,
+        output_nc: int = 3,
+        ngf: int = 64,
+        n_blocks: int = 9,
+        norm_layer: type[nn.Module] = nn.InstanceNorm2d,
+    ) -> None:
+        super().__init__()
+        use_bias = norm_layer is nn.InstanceNorm2d
+        layers: list[nn.Module] = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+            norm_layer(ngf),
+            nn.ReLU(inplace=True),
+        ]
+
+        n_downsampling = 2
+        for i in range(n_downsampling):
+            mult = 2**i
+            layers.extend(
+                [
+                    nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+                    norm_layer(ngf * mult * 2),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+
+        mult = 2**n_downsampling
+        for _ in range(n_blocks):
+            layers.append(OfficialResnetBlock(ngf * mult, norm_layer=norm_layer, use_bias=use_bias))
+
+        for i in range(n_downsampling):
+            mult = 2 ** (n_downsampling - i)
+            layers.extend(
+                [
+                    nn.ConvTranspose2d(
+                        ngf * mult,
+                        (ngf * mult) // 2,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        output_padding=1,
+                        bias=use_bias,
+                    ),
+                    norm_layer((ngf * mult) // 2),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+
+        layers.extend(
+            [
+                nn.ReflectionPad2d(3),
+                nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0),
+                nn.Tanh(),
+            ]
+        )
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
+def build_official_generator_from_state_dict(state_dict: dict[str, torch.Tensor]) -> nn.Module:
+    if "model.1.weight" not in state_dict:
+        raise KeyError("Unsupported official CycleGAN checkpoint: missing model.1.weight")
+
+    ngf = int(state_dict["model.1.weight"].shape[0])
+    block_indices = {
+        int(match.group(1))
+        for key in state_dict
+        for match in [re.match(r"model\.(\d+)\.conv_block\.1\.weight", key)]
+        if match is not None
+    }
+    if not block_indices:
+        raise KeyError("Unsupported official CycleGAN checkpoint: no conv_block weights found")
+
+    norm_layer = nn.BatchNorm2d if any(key.endswith("running_mean") for key in state_dict) else nn.InstanceNorm2d
+    generator = OfficialResnetGenerator(ngf=ngf, n_blocks=len(block_indices), norm_layer=norm_layer)
+    generator.load_state_dict(state_dict)
+    return generator
 
 
 class NLayerDiscriminator(nn.Module):
