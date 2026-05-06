@@ -6,6 +6,7 @@ checkpoints/
 outputs/
 pytorch-CycleGAN-and-pix2pix/
 download/
+archive/
 
 # files
 *.log
